@@ -1,7 +1,1 @@
-{
-  "functions": {
-    "api/proxy.py": {
-      "runtime": "python3.12"
-    }
-  }
-}
+{}
