@@ -1,12 +1,13 @@
 """
 Vidira - Vercel Proxy (Python)
-Fetch URL video/HLS apapun dan forward ke browser dengan CORS header.
-Supports: m3u8, ts, mp4, dan format lain.
+Fetch URL video/HLS/DASH apapun dan forward ke browser dengan CORS header.
+Supports: m3u8, ts, mp4, mpd, dan format lain.
 """
 
 import urllib.request
 import urllib.parse
 import urllib.error
+import re
 from http.server import BaseHTTPRequestHandler
 
 
@@ -68,9 +69,19 @@ class handler(BaseHTTPRequestHandler):
                 'x-mpegurl' in content_type.lower()
             )
 
+            # Kalau mpd — rewrite semua URL segment lewat proxy
+            is_mpd = (
+                '.mpd' in target.lower() or
+                'dash+xml' in content_type.lower() or
+                'application/dash' in content_type.lower()
+            )
+
             if is_m3u8:
                 body = self._rewrite_m3u8(body, target, referer, ua)
                 content_type = 'application/vnd.apple.mpegurl'
+            elif is_mpd:
+                body = self._rewrite_mpd(body, target, referer, ua)
+                content_type = 'application/dash+xml'
 
             self.send_response(200)
             self.send_header('Content-Type',                content_type)
@@ -117,6 +128,60 @@ class handler(BaseHTTPRequestHandler):
             out.append(proxied)
 
         return '\n'.join(out).encode('utf-8')
+
+    def _rewrite_mpd(self, body: bytes, base_url: str, referer: str, ua: str = None) -> bytes:
+        """
+        Rewrite semua URL segment dalam MPD (DASH) supaya lewat proxy ini.
+        MPD pakai format XML — kita rewrite atribut media= dan initialization=
+        di dalam SegmentTemplate, serta BaseURL.
+        """
+        text     = body.decode('utf-8', errors='replace')
+        base     = base_url[:base_url.rfind('/') + 1]
+        ref_enc  = urllib.parse.quote(referer, safe='') if referer else ''
+        ua_enc   = urllib.parse.quote(ua, safe='') if ua else ''
+
+        def make_proxy(url):
+            # Jadikan absolute dulu
+            if url.startswith('http://') or url.startswith('https://'):
+                abs_url = url
+            else:
+                abs_url = base + url
+            enc = urllib.parse.quote(abs_url, safe='')
+            p   = f'/api/proxy?url={enc}'
+            if ref_enc:
+                p += f'&ref={ref_enc}'
+            if ua_enc:
+                p += f'&ua={ua_enc}'
+            return p
+
+        # Rewrite BaseURL tag
+        def rewrite_baseurl(m):
+            url = m.group(1).strip()
+            if url.startswith('http://') or url.startswith('https://'):
+                abs_url = url
+            else:
+                abs_url = base + url
+            return f'<BaseURL>{make_proxy(abs_url)}</BaseURL>'
+
+        text = re.sub(r'<BaseURL>(.*?)<\/BaseURL>', rewrite_baseurl, text, flags=re.DOTALL)
+
+        # Rewrite media= dan initialization= di SegmentTemplate
+        def rewrite_attr(m):
+            attr = m.group(1)   # 'media' atau 'initialization'
+            val  = m.group(2)   # nilai atributnya
+            # Kalau sudah absolute, proxy langsung
+            # Kalau relative (tidak ada http), jadikan absolute dulu
+            if val.startswith('http://') or val.startswith('https://'):
+                proxied = make_proxy(val)
+            else:
+                # Relative — base + val, tapi jangan encode $Time$ dan $RepresentationID$
+                abs_url = base + val
+                proxied = make_proxy(abs_url)
+            return f'{attr}="{proxied}"'
+
+        text = re.sub(r'(media|initialization)="([^"]+)"', rewrite_attr, text)
+
+        return text.encode('utf-8')
 
     def _cors(self):
         self.send_header('Access-Control-Allow-Origin',  '*')
