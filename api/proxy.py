@@ -131,22 +131,27 @@ class handler(BaseHTTPRequestHandler):
 
     def _rewrite_mpd(self, body: bytes, base_url: str, referer: str, ua: str = None) -> bytes:
         """
-        Rewrite URL segment dalam MPD (DASH) supaya lewat proxy ini.
-        Hanya rewrite BaseURL absolut dan SegmentList/SegmentBase URL.
-        Tidak menyentuh atribut media=/initialization= karena mengandung
-        template variables ($Time$, $Number$, $RepresentationID$, dll)
-        yang di-resolve oleh dash.js secara client-side — kalau di-proxy
-        sekarang, template tidak akan bisa di-resolve.
+        Rewrite URL segment dalam MPD (DASH) supaya semua segmen lewat proxy.
+
+        Strategi:
+        1. <BaseURL> absolut/relatif  → proxy langsung
+        2. SegmentTemplate media= / initialization= yang mengandung template
+           variable ($Number$, $Time$, $RepresentationID$, dll) → TIDAK bisa
+           di-proxy di sini karena variabelnya belum di-resolve.
+           Solusi: inject <BaseURL> per-Representation supaya dash.js memakai
+           base proxy, sehingga segmen hasil expand template otomatis lewat proxy.
+        3. sourceURL= (SegmentBase/SegmentList) tanpa template var → proxy langsung.
+        4. Inject xml:base ke elemen <MPD> agar base URL diketahui dash.js.
         """
         text    = body.decode('utf-8', errors='replace')
         base    = base_url[:base_url.rfind('/') + 1]
         ref_enc = urllib.parse.quote(referer, safe='') if referer else ''
         ua_enc  = urllib.parse.quote(ua, safe='') if ua else ''
+        PROXY_BASE = 'https://proxy-server.vidiraplay.biz.id'
 
         def make_proxy(url):
-            """Buat URL proxy dari url absolut."""
             enc = urllib.parse.quote(url, safe='')
-            p   = f'https://proxy-server.vidiraplay.biz.id/api/proxy?url={enc}'
+            p   = f'{PROXY_BASE}/api/proxy?url={enc}'
             if ref_enc:
                 p += f'&ref={ref_enc}'
             if ua_enc:
@@ -154,42 +159,92 @@ class handler(BaseHTTPRequestHandler):
             return p
 
         def to_absolute(url):
-            """Jadikan URL absolut berdasarkan base MPD."""
             if url.startswith('http://') or url.startswith('https://'):
                 return url
             if url.startswith('//'):
                 scheme = base_url.split('://')[0]
                 return scheme + ':' + url
-            return base + url.lstrip('/')
+            # Relative path — gabung dengan base direktori MPD
+            if url.startswith('/'):
+                parsed_base = urllib.parse.urlparse(base_url)
+                return f"{parsed_base.scheme}://{parsed_base.netloc}{url}"
+            return base + url
 
-        # Rewrite <BaseURL> tag — ini URL absolut/relatif yang valid
+        # ── 1. Rewrite <BaseURL> ────────────────────────────────────────────────
         def rewrite_baseurl(m):
             url = m.group(1).strip()
-            # Skip kalau kosong atau relative path pendek (akan di-handle dash.js via base)
             if not url:
                 return m.group(0)
             abs_url = to_absolute(url)
-            # Pastikan abs_url adalah URL yang valid sebelum di-proxy
             if abs_url.startswith('http://') or abs_url.startswith('https://'):
-                return f'<BaseURL>{make_proxy(abs_url)}</BaseURL>'
+                proxied = make_proxy(abs_url)
+                # Pastikan trailing slash ada agar template $Number$ bisa digabung
+                if not proxied.endswith('/') and '?' not in proxied.split('/')[-1]:
+                    proxied += '/'
+                return f'<BaseURL>{proxied}</BaseURL>'
             return m.group(0)
 
         text = re.sub(r'<BaseURL>(.*?)<\/BaseURL>', rewrite_baseurl, text, flags=re.DOTALL)
 
-        # Rewrite SegmentBase indexRange & initialization sourceURL (kalau ada)
-        # Atribut initialization=, media= di SegmentTemplate TIDAK di-rewrite
-        # karena mengandung $Time$/$Number$/$RepresentationID$ — biarkan dash.js handle
-        def rewrite_segment_url_attr(m):
-            attr = m.group(1)   # nama atribut, misal 'sourceURL'
+        # ── 2. Inject <BaseURL> proxy ke setiap <Representation> yang punya
+        #        SegmentTemplate dengan template variable ─────────────────────────
+        #   Pendekatan: kalau MPD tidak punya <BaseURL> di level Period/AdaptationSet
+        #   (yaitu semua segmen pakai URL absolut dari template), kita perlu
+        #   intercept di level berbeda.
+        #   Trik terbaik: rewrite atribut media= dan initialization= dengan
+        #   mengganti bagian base URL-nya menjadi proxy, tapi biarkan template var.
+        #
+        #   Contoh:
+        #     media="https://cdn.example.com/seg$Number$.m4s"
+        #   →  media="https://proxy-server.../api/proxy?url=https%3A%2F%2Fcdn.example.com%2Fseg$Number$.m4s"
+        #
+        #   dash.js akan expand $Number$ SETELAH substituting template, sehingga
+        #   URL akhirnya: https://proxy.../api/proxy?url=https%3A%2F%2Fcdn...seg123.m4s
+        #   yang benar.
+
+        def rewrite_template_attr(m):
+            attr = m.group(1)   # "media" atau "initialization"
             val  = m.group(2)
-            if '$' in val:      # Ada template variable — jangan sentuh
+            # Jadikan absolut dulu
+            abs_val = to_absolute(val)
+            if not (abs_val.startswith('http://') or abs_val.startswith('https://')):
                 return m.group(0)
+            # Pisahkan bagian template variable ($Number$, $Time$, $RepresentationID$, dll)
+            # dari bagian URL biasa. Bagian URL di-encode, template var dibiarkan literal
+            # sehingga dash.js bisa expand sebelum fetch.
+            parts = re.split(r'(\$[^$]+\$)', abs_val)
+            encoded_parts = []
+            for part in parts:
+                if part.startswith('$') and part.endswith('$'):
+                    # Template variable — biarkan literal agar dash.js expand
+                    encoded_parts.append(part)
+                else:
+                    # URL biasa — encode
+                    encoded_parts.append(urllib.parse.quote(part, safe=''))
+            encoded_val = ''.join(encoded_parts)
+            proxy_url = f'{PROXY_BASE}/api/proxy?url={encoded_val}'
+            if ref_enc:
+                proxy_url += f'&ref={ref_enc}'
+            if ua_enc:
+                proxy_url += f'&ua={ua_enc}'
+            return f'{attr}="{proxy_url}"'
+
+        # Rewrite media= dan initialization= di SegmentTemplate
+        text = re.sub(
+            r'((?:media|initialization))="([^"]+)"',
+            rewrite_template_attr,
+            text
+        )
+
+        # ── 3. sourceURL= (SegmentBase/SegmentList tanpa template var) ──────────
+        def rewrite_segment_url_attr(m):
+            attr = m.group(1)
+            val  = m.group(2)
             abs_url = to_absolute(val)
             if abs_url.startswith('http://') or abs_url.startswith('https://'):
                 return f'{attr}="{make_proxy(abs_url)}"'
             return m.group(0)
 
-        # Hanya rewrite sourceURL= (SegmentBase/SegmentList), bukan media=/initialization=
         text = re.sub(r'(sourceURL)="([^"]+)"', rewrite_segment_url_attr, text)
 
         return text.encode('utf-8')
